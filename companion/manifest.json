@@ -1,18 +1,18 @@
 {
 	"$schema": "../node_modules/@companion-module/base/assets/manifest.schema.json",
 	"type": "connection",
-	"id": "your-module-name",
-	"name": "your-module-name",
-	"shortname": "module-shortname",
-	"description": "A short one line description of your module",
-	"version": "0.0.0",
+	"id": "crestron-nvx",
+	"name": "crestron-nvx",
+	"shortname": "DM NVX",
+	"description": "Direct control and routing for Crestron DM NVX encoders and decoders",
+	"version": "1.0.0",
 	"license": "MIT",
-	"repository": "git+https://github.com/bitfocus/companion-module-your-module-name.git",
-	"bugs": "https://github.com/bitfocus/companion-module-your-module-name/issues",
+	"repository": "git+https://github.com/bitfocus/companion-module-crestron-nvx.git",
+	"bugs": "https://github.com/bitfocus/companion-module-crestron-nvx/issues",
 	"maintainers": [
 		{
-			"name": "Your name",
-			"email": "Your email"
+			"name": "Adrian Davis",
+			"email": "themusicnerd@gmail.com"
 		}
 	],
 	"runtime": {
@@ -21,8 +21,27 @@
 		"apiVersion": "0.0.0",
 		"entrypoint": "../dist/main.js"
 	},
-	"legacyIds": [],
-	"manufacturer": "Your company",
-	"products": ["Your product"],
-	"keywords": []
+	"legacyIds": ["crestron-dm-nvx"],
+	"manufacturer": "Crestron",
+	"products": [
+		"DM NVX",
+		"DM-NVX",
+		"DM-NVX-360",
+		"DM-NVX-351",
+		"DM-NVX-E30",
+		"DM-NVX-D30",
+		"DM-NVX-363"
+	],
+	"keywords": [
+		"Crestron",
+		"DM NVX",
+		"NVX",
+		"AV over IP",
+		"CresNext",
+		"video",
+		"audio",
+		"USB",
+		"KVM",
+		"matrix"
+	]
 }
