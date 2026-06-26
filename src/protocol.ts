@@ -85,6 +85,12 @@ interface Cookie {
 	value: string
 }
 
+interface SessionState {
+	cookies: Cookie[]
+	httpAgent: http.Agent
+	httpsAgent: https.Agent
+}
+
 type Dictionary = Record<string, unknown>
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -123,7 +129,207 @@ function mergeCookies(existing: Cookie[], headers: http.IncomingHttpHeaders): Co
 	return [...next.entries()].map(([name, value]) => ({ name, value }))
 }
 
+function sessionKey(options: RequestOptions): string {
+	return [
+		options.protocol,
+		options.host,
+		options.port,
+		options.authenticated ? 'auth' : 'no-auth',
+		options.username,
+		options.allowSelfSigned ? 'self-signed' : 'strict',
+	].join('|')
+}
+
+export class NvxProtocolSession {
+	private readonly sessions = new Map<string, SessionState>()
+
+	reset(): void {
+		for (const session of this.sessions.values()) {
+			session.httpAgent.destroy()
+			session.httpsAgent.destroy()
+		}
+		this.sessions.clear()
+	}
+
+	async cresNextGet(options: RequestOptions, path: string): Promise<CresNextResult> {
+		const { result } = await this.requestWithAuth(options, 'GET', normalizePath(path))
+		if (result.statusCode < 200 || result.statusCode >= 300) {
+			throw new Error(`GET ${path} failed with HTTP ${result.statusCode}`)
+		}
+		return result
+	}
+
+	async cresNextPost(options: RequestOptions, path: string, payload: unknown): Promise<CresNextResult> {
+		const { result } = await this.requestWithAuth(options, 'POST', normalizePath(path), JSON.stringify(payload))
+		if (result.statusCode < 200 || result.statusCode >= 300) {
+			throw new Error(`POST ${path} failed with HTTP ${result.statusCode}`)
+		}
+		validateActions(result.body)
+		return result
+	}
+
+	async fetchEndpoint(
+		host: string,
+		config: ModuleConfig,
+		secrets: ModuleSecrets,
+		timeoutOverride?: number,
+	): Promise<NvxEndpoint> {
+		const errors: string[] = []
+		for (const options of getCandidateOptions(host, config, secrets, timeoutOverride)) {
+			try {
+				return await this.readEndpoint(options, config)
+			} catch (error) {
+				errors.push(
+					`${options.protocol}${options.authenticated ? '+auth' : ''}: ${error instanceof Error ? error.message : String(error)}`,
+				)
+			}
+		}
+		throw new Error(errors.join(' | '))
+	}
+
+	async discoverEndpoints(config: ModuleConfig, secrets: ModuleSecrets): Promise<DiscoveryResult> {
+		const knownHosts = parseKnownHosts(config.knownEndpoints || '')
+		const hosts =
+			config.mode === 'endpoint'
+				? [(config.endpointHost || '').trim()].filter(Boolean)
+				: knownHosts.length > 0
+					? knownHosts
+					: expandCidr(config.discoverySubnet || '', 1024)
+		const concurrency = Math.max(1, Math.min(64, numberValue(config.scanConcurrency, 16)))
+		const timeoutMs = numberValue(config.scanTimeoutMs, 1200)
+		const endpoints: NvxEndpoint[] = []
+		const errors: string[] = []
+		let index = 0
+
+		async function worker(session: NvxProtocolSession): Promise<void> {
+			for (;;) {
+				const host = hosts[index++]
+				if (!host) return
+				try {
+					endpoints.push(await session.fetchEndpoint(host, config, secrets, timeoutMs))
+				} catch (error) {
+					errors.push(`${host}: ${error instanceof Error ? error.message : String(error)}`)
+				}
+			}
+		}
+
+		await Promise.all(Array.from({ length: Math.min(concurrency, hosts.length) }, async () => worker(this)))
+		endpoints.sort((a, b) => a.host.localeCompare(b.host, undefined, { numeric: true }))
+		return { endpoints, errors }
+	}
+
+	private getSession(options: RequestOptions): SessionState {
+		const key = sessionKey(options)
+		const existing = this.sessions.get(key)
+		if (existing) return existing
+
+		const session: SessionState = {
+			cookies: [],
+			httpAgent: new http.Agent({ keepAlive: true }),
+			httpsAgent: new https.Agent({ keepAlive: true, rejectUnauthorized: !options.allowSelfSigned }),
+		}
+		this.sessions.set(key, session)
+		return session
+	}
+
+	getAgent(options: RequestOptions): http.Agent | https.Agent {
+		const session = this.getSession(options)
+		return options.protocol === 'https' ? session.httpsAgent : session.httpAgent
+	}
+
+	private async authenticate(options: RequestOptions): Promise<Cookie[]> {
+		const session = this.getSession(options)
+		let cookies = session.cookies
+		const loginPage = await request(this, options, 'GET', '/userlogin.html', undefined, cookies)
+		cookies = loginPage.cookies
+
+		const form = `login=${encodeURIComponent(options.username)}&&passwd=${encodeURIComponent(options.password)}`
+		const login = await request(
+			this,
+			options,
+			'POST',
+			'/userlogin.html',
+			form,
+			cookies,
+			'application/x-www-form-urlencoded',
+		)
+		cookies = login.cookies
+
+		if (![200, 302].includes(login.result.statusCode)) {
+			throw new Error(`Login failed with HTTP ${login.result.statusCode}`)
+		}
+
+		session.cookies = cookies
+		return cookies
+	}
+
+	private async requestWithAuth(
+		options: RequestOptions,
+		method: 'GET' | 'POST',
+		path: string,
+		body?: string,
+		contentType = 'application/json',
+	): Promise<{ result: CresNextResult; cookies: Cookie[] }> {
+		const session = this.getSession(options)
+		if (options.authenticated && session.cookies.length === 0) {
+			session.cookies = await this.authenticate(options)
+		}
+
+		let response = await request(
+			this,
+			options,
+			method,
+			path,
+			body,
+			options.authenticated ? session.cookies : [],
+			contentType,
+		)
+		if (options.authenticated && response.result.statusCode === 401) {
+			session.cookies = await this.authenticate(options)
+			response = await request(this, options, method, path, body, session.cookies, contentType)
+		}
+
+		if (options.authenticated) session.cookies = response.cookies
+		return response
+	}
+
+	private async safeGetWithCookies(options: RequestOptions, path: string): Promise<{ body: unknown }> {
+		try {
+			const response = await this.requestWithAuth(options, 'GET', path)
+			if (response.result.statusCode < 200 || response.result.statusCode >= 300) {
+				return { body: undefined }
+			}
+			return { body: response.result.body }
+		} catch {
+			return { body: undefined }
+		}
+	}
+
+	private async readEndpoint(options: RequestOptions, config: ModuleConfig): Promise<NvxEndpoint> {
+		const deviceInfoResult = await this.safeGetWithCookies(options, '/Device/DeviceInfo')
+		const usbResult = await this.safeGetWithCookies(options, '/Device/Usb')
+		const avioResult = await this.safeGetWithCookies(options, '/Device/AudioVideoInputOutput')
+		const avRoutingResult = await this.safeGetWithCookies(options, '/Device/AvRouting')
+		const deviceSpecificResult = await this.safeGetWithCookies(options, '/Device/DeviceSpecific')
+		const discoveredStreamsResult = await this.safeGetWithCookies(options, '/Device/DiscoveredStreams')
+		const xioSubscriptionResult = await this.safeGetWithCookies(options, '/Device/XioSubscription')
+		const streamTransmitResult = await this.safeGetWithCookies(options, '/Device/StreamTransmit')
+
+		return parseEndpoint(options, config, {
+			deviceInfo: deviceInfoResult.body,
+			usb: usbResult.body,
+			avio: avioResult.body,
+			avRouting: avRoutingResult.body,
+			deviceSpecific: deviceSpecificResult.body,
+			discoveredStreams: discoveredStreamsResult.body,
+			xioSubscription: xioSubscriptionResult.body,
+			streamTransmit: streamTransmitResult.body,
+		})
+	}
+}
+
 async function request(
+	session: NvxProtocolSession,
 	options: RequestOptions,
 	method: 'GET' | 'POST',
 	path: string,
@@ -143,9 +349,6 @@ async function request(
 		headers['Content-Length'] = Buffer.byteLength(body)
 	}
 
-	const agent =
-		options.protocol === 'https' ? new https.Agent({ rejectUnauthorized: !options.allowSelfSigned }) : new http.Agent()
-
 	return new Promise((resolve, reject) => {
 		const transport = options.protocol === 'https' ? https : http
 		const req = transport.request(
@@ -153,7 +356,7 @@ async function request(
 			{
 				method,
 				headers,
-				agent,
+				agent: session.getAgent(options),
 				timeout: options.timeoutMs,
 			},
 			(res) => {
@@ -191,45 +394,14 @@ async function request(
 	})
 }
 
-async function authenticate(options: RequestOptions): Promise<Cookie[]> {
-	let cookies: Cookie[] = []
-	const loginPage = await request(options, 'GET', '/userlogin.html', undefined, cookies)
-	cookies = loginPage.cookies
-
-	const form = `login=${encodeURIComponent(options.username)}&&passwd=${encodeURIComponent(options.password)}`
-	const login = await request(options, 'POST', '/userlogin.html', form, cookies, 'application/x-www-form-urlencoded')
-	cookies = login.cookies
-
-	if (![200, 302].includes(login.result.statusCode)) {
-		throw new Error(`Login failed with HTTP ${login.result.statusCode}`)
-	}
-
-	return cookies
-}
-
-async function withSession<T>(options: RequestOptions, task: (cookies: Cookie[]) => Promise<T>): Promise<T> {
-	const cookies = options.authenticated ? await authenticate(options) : []
-	return task(cookies)
-}
+const defaultProtocolSession = new NvxProtocolSession()
 
 export async function cresNextGet(options: RequestOptions, path: string): Promise<CresNextResult> {
-	return withSession(options, async (cookies) => {
-		const { result } = await request(options, 'GET', normalizePath(path), undefined, cookies)
-		if (result.statusCode < 200 || result.statusCode >= 300)
-			throw new Error(`GET ${path} failed with HTTP ${result.statusCode}`)
-		return result
-	})
+	return defaultProtocolSession.cresNextGet(options, path)
 }
 
 export async function cresNextPost(options: RequestOptions, path: string, payload: unknown): Promise<CresNextResult> {
-	return withSession(options, async (cookies) => {
-		const { result } = await request(options, 'POST', normalizePath(path), JSON.stringify(payload), cookies)
-		if (result.statusCode < 200 || result.statusCode >= 300) {
-			throw new Error(`POST ${path} failed with HTTP ${result.statusCode}`)
-		}
-		validateActions(result.body)
-		return result
-	})
+	return defaultProtocolSession.cresNextPost(options, path, payload)
 }
 
 function validateActions(body: unknown): void {
@@ -305,46 +477,25 @@ export async function fetchEndpoint(
 	secrets: ModuleSecrets,
 	timeoutOverride?: number,
 ): Promise<NvxEndpoint> {
-	const errors: string[] = []
-	for (const options of getCandidateOptions(host, config, secrets, timeoutOverride)) {
-		try {
-			return await readEndpoint(options, config)
-		} catch (error) {
-			errors.push(
-				`${options.protocol}${options.authenticated ? '+auth' : ''}: ${error instanceof Error ? error.message : String(error)}`,
-			)
-		}
-	}
-	throw new Error(errors.join(' | '))
+	return defaultProtocolSession.fetchEndpoint(host, config, secrets, timeoutOverride)
 }
 
-async function readEndpoint(options: RequestOptions, config: ModuleConfig): Promise<NvxEndpoint> {
-	let cookies = options.authenticated ? await authenticate(options) : []
-	const deviceInfoResult = await safeGetWithCookies(options, cookies, '/Device/DeviceInfo')
-	cookies = deviceInfoResult.cookies
-	const usbResult = await safeGetWithCookies(options, cookies, '/Device/Usb')
-	cookies = usbResult.cookies
-	const avioResult = await safeGetWithCookies(options, cookies, '/Device/AudioVideoInputOutput')
-	cookies = avioResult.cookies
-	const avRoutingResult = await safeGetWithCookies(options, cookies, '/Device/AvRouting')
-	cookies = avRoutingResult.cookies
-	const deviceSpecificResult = await safeGetWithCookies(options, cookies, '/Device/DeviceSpecific')
-	cookies = deviceSpecificResult.cookies
-	const discoveredStreamsResult = await safeGetWithCookies(options, cookies, '/Device/DiscoveredStreams')
-	cookies = discoveredStreamsResult.cookies
-	const xioSubscriptionResult = await safeGetWithCookies(options, cookies, '/Device/XioSubscription')
-	cookies = xioSubscriptionResult.cookies
-	const streamTransmitResult = await safeGetWithCookies(options, cookies, '/Device/StreamTransmit')
-
-	const deviceInfo = deviceInfoResult.body
-	const usb = usbResult.body
-	const avio = avioResult.body
-	const avRouting = avRoutingResult.body
-	const deviceSpecific = deviceSpecificResult.body
-	const discoveredStreams = discoveredStreamsResult.body
-	const xioSubscription = xioSubscriptionResult.body
-	const streamTransmit = streamTransmitResult.body
-
+function parseEndpoint(
+	options: RequestOptions,
+	config: ModuleConfig,
+	responses: {
+		deviceInfo?: unknown
+		usb?: unknown
+		avio?: unknown
+		avRouting?: unknown
+		deviceSpecific?: unknown
+		discoveredStreams?: unknown
+		xioSubscription?: unknown
+		streamTransmit?: unknown
+	},
+): NvxEndpoint {
+	const { deviceInfo, usb, avio, avRouting, deviceSpecific, discoveredStreams, xioSubscription, streamTransmit } =
+		responses
 	if (
 		deviceInfo === undefined &&
 		usb === undefined &&
@@ -426,22 +577,6 @@ function parseInputs(value: unknown): NvxInput[] {
 			syncDetected: booleanValue(port?.IsSyncDetected),
 		}
 	})
-}
-
-async function safeGetWithCookies(
-	options: RequestOptions,
-	cookies: Cookie[],
-	path: string,
-): Promise<{ body: unknown; cookies: Cookie[] }> {
-	try {
-		const response = await request(options, 'GET', path, undefined, cookies)
-		if (response.result.statusCode < 200 || response.result.statusCode >= 300) {
-			return { body: undefined, cookies: response.cookies }
-		}
-		return { body: response.result.body, cookies: response.cookies }
-	} catch {
-		return { body: undefined, cookies }
-	}
 }
 
 function findDeviceInfo(value: unknown): Dictionary {
@@ -665,34 +800,7 @@ function parseKnownHosts(raw: string): string[] {
 }
 
 export async function discoverEndpoints(config: ModuleConfig, secrets: ModuleSecrets): Promise<DiscoveryResult> {
-	const knownHosts = parseKnownHosts(config.knownEndpoints || '')
-	const hosts =
-		config.mode === 'endpoint'
-			? [(config.endpointHost || '').trim()].filter(Boolean)
-			: knownHosts.length > 0
-				? knownHosts
-				: expandCidr(config.discoverySubnet || '', 1024)
-	const concurrency = Math.max(1, Math.min(64, numberValue(config.scanConcurrency, 16)))
-	const timeoutMs = numberValue(config.scanTimeoutMs, 1200)
-	const endpoints: NvxEndpoint[] = []
-	const errors: string[] = []
-	let index = 0
-
-	async function worker(): Promise<void> {
-		for (;;) {
-			const host = hosts[index++]
-			if (!host) return
-			try {
-				endpoints.push(await fetchEndpoint(host, config, secrets, timeoutMs))
-			} catch (error) {
-				errors.push(`${host}: ${error instanceof Error ? error.message : String(error)}`)
-			}
-		}
-	}
-
-	await Promise.all(Array.from({ length: Math.min(concurrency, hosts.length) }, async () => worker()))
-	endpoints.sort((a, b) => a.host.localeCompare(b.host, undefined, { numeric: true }))
-	return { endpoints, errors }
+	return defaultProtocolSession.discoverEndpoints(config, secrets)
 }
 
 export function buildRoutePayload(sourceId: string, routeMode: DefaultRouteMode | SignalKind | 'av'): unknown {

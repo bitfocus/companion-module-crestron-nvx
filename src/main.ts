@@ -11,11 +11,8 @@ import {
 	buildInputPayload,
 	buildTransmitBitratePayload,
 	buildUsbModePayload,
-	cresNextGet,
-	cresNextPost,
-	discoverEndpoints,
-	fetchEndpoint,
 	getRequestOptionsForEndpoint,
+	NvxProtocolSession,
 	type NvxEndpoint,
 	type NvxSource,
 	type SignalKind,
@@ -51,6 +48,10 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 	private destroyed = false
 	private generation = 0
 	private refreshInFlight: Promise<void> | undefined
+	private discoveryInFlight: Promise<void> | undefined
+	private activeDestinationHost = ''
+	private definitionSignature = ''
+	private readonly protocol = new NvxProtocolSession()
 
 	constructor(internal: unknown) {
 		super(internal)
@@ -61,10 +62,9 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		this.secrets = secrets ?? {}
 		this.destroyed = false
 		this.generation += 1
-		this.updateActions()
-		this.updateFeedbacks()
-		this.updatePresets()
-		this.updateVariableDefinitions()
+		this.activeDestinationHost = config.activeDestination || ''
+		this.protocol.reset()
+		this.updateDefinitions(true)
 		this.updateVariables()
 		await this.start()
 	}
@@ -75,6 +75,8 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		this.stopPolling()
 		this.clearDiscoveryTimer()
 		this.refreshInFlight = undefined
+		this.discoveryInFlight = undefined
+		this.protocol.reset()
 		this.isReady = false
 		this.updateStatus(InstanceStatus.Disconnected)
 	}
@@ -86,10 +88,11 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		this.generation += 1
 		this.stopPolling()
 		this.clearDiscoveryTimer()
-		this.updateActions()
-		this.updateFeedbacks()
-		this.updatePresets()
-		this.updateVariableDefinitions()
+		this.refreshInFlight = undefined
+		this.discoveryInFlight = undefined
+		this.activeDestinationHost = config.activeDestination || ''
+		this.protocol.reset()
+		this.updateDefinitions(true)
 		this.updateVariables()
 		await this.start()
 	}
@@ -186,7 +189,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 
 	getActiveDestination(): NvxEndpoint | undefined {
 		if (this.config.mode === 'endpoint') return this.endpoints[0]
-		const selected = (this.config.activeDestination || '').trim()
+		const selected = this.activeDestinationHost.trim()
 		if (selected) return this.endpoints.find((endpoint) => endpoint.host === selected)
 		return this.getDestinations()[0]
 	}
@@ -269,8 +272,15 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		if (this.config.mode === 'endpoint' || this.config.autoDiscover !== false) {
 			this.discoveryTimer = setTimeout(() => {
 				this.discoveryTimer = undefined
-				if (!this.destroyed && generation === this.generation) void this.discover()
+				if (this.destroyed || generation !== this.generation) return
+				const discovery = this.discover()
+				this.discoveryInFlight = discovery
+				void discovery.finally(() => {
+					if (this.discoveryInFlight === discovery) this.discoveryInFlight = undefined
+					if (!this.destroyed && generation === this.generation) this.startPolling()
+				})
 			}, 10)
+			return
 		}
 
 		this.startPolling()
@@ -283,10 +293,12 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		this.updateVariables()
 
 		try {
-			const result = await discoverEndpoints(this.config, this.secrets)
+			const previousSignature = this.getDefinitionSignature()
+			const result = await this.protocol.discoverEndpoints(this.config, this.secrets)
 			if (this.destroyed || generation !== this.generation) return
 			this.endpoints = result.endpoints
 			this.rebuildSources()
+			const structureChanged = previousSignature !== this.getDefinitionSignature()
 			this.discoverySummary = `${result.endpoints.length} endpoint(s) discovered`
 			this.lastResponse = this.discoverySummary
 			this.lastError =
@@ -296,7 +308,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 				this.isReady ? InstanceStatus.Ok : InstanceStatus.ConnectionFailure,
 				this.lastError || undefined,
 			)
-			this.afterStateChanged()
+			this.afterStateChanged(structureChanged)
 		} catch (error) {
 			this.handleError(error)
 		}
@@ -312,6 +324,10 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 
 	private async refreshStatusInternal(): Promise<void> {
 		const generation = this.generation
+		if (this.discoveryInFlight) {
+			await this.discoveryInFlight
+			return
+		}
 		const current = [...this.endpoints]
 		if (current.length === 0) {
 			await this.discover()
@@ -320,17 +336,21 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 
 		this.lastCommand = 'Refresh status'
 		try {
+			const previousSignature = this.getDefinitionSignature()
 			const refreshed = await Promise.all(
-				current.map(async (endpoint) => fetchEndpoint(endpoint.host, this.config, this.secrets).catch(() => endpoint)),
+				current.map(async (endpoint) =>
+					this.protocol.fetchEndpoint(endpoint.host, this.config, this.secrets).catch(() => endpoint),
+				),
 			)
 			if (this.destroyed || generation !== this.generation) return
 			this.endpoints = refreshed
 			this.rebuildSources()
+			const structureChanged = previousSignature !== this.getDefinitionSignature()
 			this.isReady = this.endpoints.length > 0
 			this.lastResponse = `${this.endpoints.length} endpoint(s) refreshed`
 			this.lastError = ''
 			this.updateStatus(this.isReady ? InstanceStatus.Ok : InstanceStatus.ConnectionFailure)
-			this.afterStateChanged()
+			this.afterStateChanged(structureChanged)
 		} catch (error) {
 			this.handleError(error)
 		}
@@ -339,10 +359,10 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 	async setActiveDestination(host: string): Promise<void> {
 		const endpoint = this.endpoints.find((endpoint) => endpoint.host === host)
 		if (!endpoint) throw new Error(`Destination ${host} is not discovered`)
-		this.config.activeDestination = endpoint.host
+		this.activeDestinationHost = endpoint.host
 		this.lastCommand = `Set active destination ${endpoint.host}`
 		this.lastResponse = endpoint.label
-		this.afterStateChanged()
+		this.afterStateChanged(false)
 	}
 
 	async routeSource(sourceId: string, mode: DefaultRouteMode | SignalKind | 'av'): Promise<void> {
@@ -355,7 +375,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		const requestOptions = getRequestOptionsForEndpoint(destination, this.config, this.secrets)
 		const payload = buildRoutePayload(id, mode)
 		this.lastCommand = `Route ${mode} ${source?.label ?? id} to ${destination.label}`
-		const result = await cresNextPost(requestOptions, '/Device/AvRouting', payload)
+		const result = await this.protocol.cresNextPost(requestOptions, '/Device/AvRouting', payload)
 		this.lastResponse = truncate(result.rawBody || JSON.stringify(result.body))
 		await this.refreshStatus()
 	}
@@ -369,7 +389,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 				? buildRouteControlPayload({ usbFollowsVideo: enabled })
 				: buildRouteControlPayload({ secondaryAudioFollowsVideo: enabled })
 		this.lastCommand = `Set ${kind} follows video ${enabled ? 'on' : 'off'}`
-		const result = await cresNextPost(requestOptions, '/Device/AvRouting', payload)
+		const result = await this.protocol.cresNextPost(requestOptions, '/Device/AvRouting', payload)
 		this.lastResponse = truncate(result.rawBody || JSON.stringify(result.body))
 		await this.refreshStatus()
 	}
@@ -378,7 +398,11 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		const endpoint = this.resolveEndpoint(host)
 		const requestOptions = getRequestOptionsForEndpoint(endpoint, this.config, this.secrets)
 		this.lastCommand = `Set ${endpoint.host} mode ${mode}`
-		const result = await cresNextPost(requestOptions, '/Device/DeviceSpecific', buildDeviceModePayload(mode))
+		const result = await this.protocol.cresNextPost(
+			requestOptions,
+			'/Device/DeviceSpecific',
+			buildDeviceModePayload(mode),
+		)
 		this.lastResponse = truncate(result.rawBody || JSON.stringify(result.body))
 		await this.refreshStatus()
 	}
@@ -389,7 +413,11 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		if (!nextName) throw new Error('Hostname is required')
 		const requestOptions = getRequestOptionsForEndpoint(endpoint, this.config, this.secrets)
 		this.lastCommand = `Set ${endpoint.host} hostname ${nextName}`
-		const result = await cresNextPost(requestOptions, '/Device/DeviceInfo', buildHostnamePayload(nextName))
+		const result = await this.protocol.cresNextPost(
+			requestOptions,
+			'/Device/DeviceInfo',
+			buildHostnamePayload(nextName),
+		)
 		this.lastResponse = truncate(result.rawBody || JSON.stringify(result.body))
 		await this.refreshStatus()
 	}
@@ -399,7 +427,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		const nextBitrate = Math.max(1, Math.min(1000000, Math.round(bitrate)))
 		const requestOptions = getRequestOptionsForEndpoint(endpoint, this.config, this.secrets)
 		this.lastCommand = `Set ${endpoint.host} transmit bitrate ${nextBitrate}`
-		const result = await cresNextPost(
+		const result = await this.protocol.cresNextPost(
 			requestOptions,
 			'/Device/StreamTransmit',
 			buildTransmitBitratePayload(nextBitrate),
@@ -417,7 +445,11 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		if (!input) throw new Error(`Input ${selected.input} is not available on ${endpoint.host}`)
 		const requestOptions = getRequestOptionsForEndpoint(endpoint, this.config, this.secrets)
 		this.lastCommand = `Set ${endpoint.host} input ${input.value}`
-		const result = await cresNextPost(requestOptions, '/Device/DeviceSpecific', buildInputPayload(input.value))
+		const result = await this.protocol.cresNextPost(
+			requestOptions,
+			'/Device/DeviceSpecific',
+			buildInputPayload(input.value),
+		)
 		this.lastResponse = truncate(result.rawBody || JSON.stringify(result.body))
 		await this.refreshStatus()
 	}
@@ -433,7 +465,11 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		if (!isStream && !input) throw new Error(`Video source ${selected.input} is not available on ${endpoint.host}`)
 		const requestOptions = getRequestOptionsForEndpoint(endpoint, this.config, this.secrets)
 		this.lastCommand = `Set ${endpoint.host} video source ${input?.label ?? 'STREAM'}`
-		const result = await cresNextPost(requestOptions, '/Device/DeviceSpecific', buildInputPayload(selected.input))
+		const result = await this.protocol.cresNextPost(
+			requestOptions,
+			'/Device/DeviceSpecific',
+			buildInputPayload(selected.input),
+		)
 		this.lastResponse = truncate(result.rawBody || JSON.stringify(result.body))
 		await this.refreshStatus()
 	}
@@ -449,7 +485,11 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		if (!isStream && !input) throw new Error(`Video source ${selected.input} is not available on ${endpoint.host}`)
 		const requestOptions = getRequestOptionsForEndpoint(endpoint, this.config, this.secrets)
 		this.lastCommand = `Set ${endpoint.host} video source ${input?.label ?? 'STREAM'}`
-		const result = await cresNextPost(requestOptions, '/Device/DeviceSpecific', buildInputPayload(selected.input))
+		const result = await this.protocol.cresNextPost(
+			requestOptions,
+			'/Device/DeviceSpecific',
+			buildInputPayload(selected.input),
+		)
 		this.lastResponse = truncate(result.rawBody || JSON.stringify(result.body))
 		await this.refreshStatus()
 	}
@@ -459,23 +499,30 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		const requestOptions = getRequestOptionsForEndpoint(endpoint, this.config, this.secrets)
 		const label = mode === 'Local' ? 'DEVICE (COMPUTER)' : 'HOST (USB PERIPHERAL)'
 		this.lastCommand = `Set ${endpoint.host} USB mode ${label}`
-		const result = await cresNextPost(requestOptions, '/Device/Usb', buildUsbModePayload(mode))
+		const result = await this.protocol.cresNextPost(requestOptions, '/Device/Usb', buildUsbModePayload(mode))
 		this.lastResponse = truncate(result.rawBody || JSON.stringify(result.body))
 		await this.refreshStatus()
 	}
 
 	async rawGet(host: string, path: string): Promise<void> {
 		const endpoint = this.resolveEndpoint(host)
-		const result = await cresNextGet(getRequestOptionsForEndpoint(endpoint, this.config, this.secrets), path)
+		const result = await this.protocol.cresNextGet(
+			getRequestOptionsForEndpoint(endpoint, this.config, this.secrets),
+			path,
+		)
 		this.lastCommand = `GET ${endpoint.host} ${path}`
 		this.lastResponse = truncate(result.rawBody || JSON.stringify(result.body))
-		this.afterStateChanged()
+		this.afterStateChanged(false)
 	}
 
 	async rawPostJson(host: string, path: string, json: string): Promise<void> {
 		const endpoint = this.resolveEndpoint(host)
 		const payload = JSON.parse(json)
-		const result = await cresNextPost(getRequestOptionsForEndpoint(endpoint, this.config, this.secrets), path, payload)
+		const result = await this.protocol.cresNextPost(
+			getRequestOptionsForEndpoint(endpoint, this.config, this.secrets),
+			path,
+			payload,
+		)
 		this.lastCommand = `POST ${endpoint.host} ${path}`
 		this.lastResponse = truncate(result.rawBody || JSON.stringify(result.body))
 		await this.refreshStatus()
@@ -576,11 +623,33 @@ export class ModuleInstance extends InstanceBase<ModuleConfig, ModuleSecrets> {
 		this.discoveryTimer = undefined
 	}
 
-	private afterStateChanged(): void {
+	private getDefinitionSignature(): string {
+		return JSON.stringify({
+			endpoints: this.endpoints.map((endpoint) => ({
+				host: endpoint.host,
+				label: endpoint.label,
+				isEncoder: endpoint.isEncoder,
+				isDecoder: endpoint.isDecoder,
+				deviceMode: endpoint.deviceMode,
+				inputs: endpoint.inputs.map((input) => `${input.value}:${input.label}:${input.portType}`),
+			})),
+			sources: this.sources.map((source) => `${source.id}:${source.label}:${source.host}`),
+			destinations: this.getDestinations().map((endpoint) => `${endpoint.host}:${endpoint.label}`),
+		})
+	}
+
+	private updateDefinitions(force = false): void {
+		const signature = this.getDefinitionSignature()
+		if (!force && signature === this.definitionSignature) return
+		this.definitionSignature = signature
 		this.updateActions()
 		this.updateFeedbacks()
 		this.updatePresets()
 		this.updateVariableDefinitions()
+	}
+
+	private afterStateChanged(structureChanged = false): void {
+		this.updateDefinitions(structureChanged)
 		this.updateVariables()
 		this.checkFeedbacks(
 			'connected',

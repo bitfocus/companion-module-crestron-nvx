@@ -323,7 +323,7 @@ export function UpdateActions(self: ModuleInstance): void {
 			],
 			callback: async (action) => {
 				await runAction(self, async () => {
-					const name = await self.parseVariablesInString(String(action.options.name ?? ''))
+					const name = String(action.options.name ?? '')
 					await self.setHostname(String(action.options.endpoint ?? ''), name)
 				})
 			},
@@ -374,7 +374,7 @@ export function UpdateActions(self: ModuleInstance): void {
 			],
 			callback: async (action) => {
 				await runAction(self, async () => {
-					const path = await self.parseVariablesInString(String(action.options.path ?? '/Device'))
+					const path = String(action.options.path ?? '/Device')
 					await self.rawGet(String(action.options.endpoint ?? ''), path)
 				})
 			},
@@ -406,8 +406,8 @@ export function UpdateActions(self: ModuleInstance): void {
 			],
 			callback: async (action) => {
 				await runAction(self, async () => {
-					const path = await self.parseVariablesInString(String(action.options.path ?? '/Device'))
-					const json = await self.parseVariablesInString(String(action.options.json ?? '{}'))
+					const path = String(action.options.path ?? '/Device')
+					const json = String(action.options.json ?? '{}')
 					await self.rawPostJson(String(action.options.endpoint ?? ''), path, json)
 				})
 			},

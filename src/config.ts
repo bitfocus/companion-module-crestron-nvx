@@ -28,14 +28,6 @@ export interface ModuleSecrets {
 	password?: string
 }
 
-function isSystemMode(options: Record<string, unknown>): boolean {
-	return (options.mode ?? 'system') === 'system'
-}
-
-function isEndpointMode(options: Record<string, unknown>): boolean {
-	return (options.mode ?? 'system') === 'endpoint'
-}
-
 export function GetConfigFields(
 	destinationChoices: Array<{ id: string; label: string }> = [],
 ): SomeCompanionConfigField[] {
@@ -59,7 +51,7 @@ export function GetConfigFields(
 			width: 8,
 			default: '',
 			regex: Regex.HOSTNAME,
-			isVisible: isEndpointMode,
+			isVisibleExpression: '$(options:mode) == "endpoint"',
 			tooltip: 'Used in single endpoint mode.',
 		},
 		{
@@ -68,7 +60,7 @@ export function GetConfigFields(
 			label: 'Discovery subnet',
 			width: 8,
 			default: '192.168.1.0/24',
-			isVisible: isSystemMode,
+			isVisibleExpression: '$(options:mode) == "system"',
 			tooltip: 'CIDR subnet scanned for DM NVX endpoints. Keep this focused, for example 192.168.1.0/24.',
 		},
 		{
@@ -77,7 +69,7 @@ export function GetConfigFields(
 			label: 'Known endpoints',
 			width: 12,
 			default: '',
-			isVisible: isSystemMode,
+			isVisibleExpression: '$(options:mode) == "system"',
 			tooltip:
 				'Optional IPs/hostnames to check directly before scanning. Separate with commas, spaces, or new lines. Example: 192.168.14.226, 192.168.14.105, 192.168.15.223.',
 		},
@@ -87,7 +79,7 @@ export function GetConfigFields(
 			label: 'Active destination',
 			width: 4,
 			default: '',
-			isVisible: isSystemMode,
+			isVisibleExpression: '$(options:mode) == "system"',
 			choices:
 				destinationChoices.length > 0
 					? [{ id: '', label: 'Auto-select first decoder' }, ...destinationChoices]
@@ -112,7 +104,7 @@ export function GetConfigFields(
 			label: 'Username',
 			width: 4,
 			default: 'admin',
-			isVisible: (options) => options.authMode !== 'http-no-auth',
+			isVisibleExpression: '$(options:authMode) != "http-no-auth"',
 		},
 		{
 			type: 'secret-text',
@@ -120,7 +112,7 @@ export function GetConfigFields(
 			label: 'Password',
 			width: 4,
 			default: '',
-			isVisible: (options) => options.authMode !== 'http-no-auth',
+			isVisibleExpression: '$(options:authMode) != "http-no-auth"',
 		},
 		{
 			type: 'number',
@@ -165,7 +157,7 @@ export function GetConfigFields(
 			label: 'Discover on startup',
 			width: 3,
 			default: true,
-			isVisible: isSystemMode,
+			isVisibleExpression: '$(options:mode) == "system"',
 		},
 		{
 			type: 'number',
@@ -175,7 +167,7 @@ export function GetConfigFields(
 			min: 1,
 			max: 64,
 			default: 16,
-			isVisible: isSystemMode,
+			isVisibleExpression: '$(options:mode) == "system"',
 		},
 		{
 			type: 'number',
@@ -185,7 +177,7 @@ export function GetConfigFields(
 			min: 250,
 			max: 10000,
 			default: 1200,
-			isVisible: isSystemMode,
+			isVisibleExpression: '$(options:mode) == "system"',
 		},
 		{
 			type: 'number',

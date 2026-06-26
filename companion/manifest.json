@@ -5,7 +5,7 @@
 	"name": "crestron-nvx",
 	"shortname": "DM NVX",
 	"description": "Direct control and routing for Crestron DM NVX encoders and decoders",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"license": "MIT",
 	"repository": "git+https://github.com/bitfocus/companion-module-crestron-nvx.git",
 	"bugs": "https://github.com/bitfocus/companion-module-crestron-nvx/issues",
@@ -21,27 +21,8 @@
 		"apiVersion": "0.0.0",
 		"entrypoint": "../dist/main.js"
 	},
-	"legacyIds": ["crestron-dm-nvx"],
+	"legacyIds": [],
 	"manufacturer": "Crestron",
-	"products": [
-		"DM NVX",
-		"DM-NVX",
-		"DM-NVX-360",
-		"DM-NVX-351",
-		"DM-NVX-E30",
-		"DM-NVX-D30",
-		"DM-NVX-363"
-	],
-	"keywords": [
-		"Crestron",
-		"DM NVX",
-		"NVX",
-		"AV over IP",
-		"CresNext",
-		"video",
-		"audio",
-		"USB",
-		"KVM",
-		"matrix"
-	]
+	"products": ["DM-NVX", "DM-NVX-360", "DM-NVX-351", "DM-NVX-E30", "DM-NVX-D30", "DM-NVX-363"],
+	"keywords": ["AV over IP", "CresNext", "video", "audio", "USB", "KVM", "matrix"]
 }
