@@ -41,10 +41,7 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 					useVariables: true,
 				},
 			],
-			callback: async (feedback, context) => {
-				const host = await context.parseVariablesInString(String(feedback.options.host ?? ''))
-				return self.isEndpointDiscovered(host)
-			},
+			callback: (feedback) => self.isEndpointDiscovered(String(feedback.options.host ?? '')),
 		},
 		endpoint_mode: {
 			type: 'boolean',
